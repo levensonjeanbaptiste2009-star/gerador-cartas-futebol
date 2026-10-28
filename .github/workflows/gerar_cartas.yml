@@ -1,1 +1,71 @@
+name: Gerar cartas de jogadores
 
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Refazer cartas que já existem?"
+        type: boolean
+        default: false
+  push:
+    paths:
+      - "players.csv"
+      - "main.py"
+
+permissions:
+  contents: write   # necessário para commitar as imagens geradas
+
+concurrency:
+  group: generate-cards
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Fontes do sistema
+        run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core fonts-liberation
+
+      - name: Cache dos modelos do rembg
+        uses: actions/cache@v4
+        with:
+          path: ~/.u2net
+          key: rembg-models-isnet-v1
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Gerar cartas
+        env:
+          FORCE: ${{ inputs.force || 'false' }}
+        run: python main.py
+
+      - name: Commitar resultados
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add output/
+          if git diff --cached --quiet; then
+            echo "Nada novo para commitar."
+          else
+            git commit -m "chore: cartas geradas automaticamente"
+            git push
+          fi
+
+      - name: Salvar também como artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: cartas
+          path: output/
+          if-no-files-found: ignore
