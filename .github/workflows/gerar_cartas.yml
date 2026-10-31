@@ -3,14 +3,22 @@ name: Gerar cartas de jogadores
 on:
   workflow_dispatch:
     inputs:
+      build_list:
+        description: "1) Montar/atualizar o players.csv a partir do clubs.csv (Wikidata)"
+        type: boolean
+        default: false
+      team:
+        description: "Processar só este clube (nome igual ao da coluna team; vazio = todos)"
+        type: string
+        default: ""
+      max_per_run:
+        description: "Máximo de cartas por execução (0 = sem limite)"
+        type: string
+        default: "300"
       force:
         description: "Refazer cartas que já existem?"
         type: boolean
         default: false
-  push:
-    paths:
-      - "players.csv"
-      - "main.py"
 
 permissions:
   contents: write   # necessário para commitar as imagens geradas
@@ -22,7 +30,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 340
 
     steps:
       - name: Checkout
@@ -46,26 +54,27 @@ jobs:
       - name: Instalar dependências
         run: pip install -r requirements.txt
 
+      - name: Montar players.csv a partir dos clubes
+        if: ${{ inputs.build_list }}
+        run: python build_players.py
+
       - name: Gerar cartas
         env:
-          FORCE: ${{ inputs.force || 'false' }}
+          FORCE: ${{ inputs.force }}
+          TEAM: ${{ inputs.team }}
+          MAX_PER_RUN: ${{ inputs.max_per_run }}
         run: python main.py
 
       - name: Commitar resultados
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add output/
+          git add players.csv output/
           if git diff --cached --quiet; then
             echo "Nada novo para commitar."
           else
             git commit -m "chore: cartas geradas automaticamente"
+            git pull --rebase
             git push
           fi
-
-      - name: Salvar também como artefato
-        uses: actions/upload-artifact@v4
-        with:
-          name: cartas
-          path: output/
-          if-no-files-found: ignore
