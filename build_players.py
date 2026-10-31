@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-Monta o players.csv automaticamente a partir do clubs.csv usando o Wikidata.
+Monta o players.csv a partir do elenco ATUAL de cada clube na Wikipédia (inglês).
 
-Entrada : clubs.csv   (colunas: name,search[,qid])
-            - name   : nome do clube (vira a pasta/coluna "team")
-            - search : termo de busca no Wikidata (ex: "Real Madrid CF")
-            - qid    : opcional, força o clube certo (ex: Q8682) se a busca errar
+Entrada : clubs.csv   (colunas: name,wikipedia)
+            - name      : nome do clube (vira a pasta/coluna "team")
+            - wikipedia : título do artigo do clube na Wikipédia em inglês
 Saída   : players.csv (name,photo_url,wiki,team)
+            - name : nome que aparece na carta
+            - wiki : título do artigo do jogador (o main.py pega a foto dele)
 
-Só entram jogadores ATUAIS (vínculo com o clube sem data de término) e que
-tenham foto cadastrada no Wikidata/Commons.
+O script lê a seção "Current squad" / "First-team squad" do artigo do clube e
+extrai os jogadores listados nela (elenco principal, inclusive emprestados).
 """
 
 import csv
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -22,78 +24,104 @@ import requests
 
 CLUBS_CSV = Path(os.getenv("CLUBS_CSV", "clubs.csv"))
 OUT_CSV = Path(os.getenv("PLAYERS_CSV", "players.csv"))
-WD_API = "https://www.wikidata.org/w/api.php"
-SPARQL = "https://query.wikidata.org/sparql"
-TIMEOUT = 60
+WP_API = "https://en.wikipedia.org/w/api.php"
+TIMEOUT = 40
+MIN_PLAYERS = 8   # abaixo disso o resultado é considerado suspeito
 HEADERS = {
     "User-Agent": "PlayerCardBot/1.0 (projeto pessoal no GitHub Actions; requests)",
-    "Accept": "application/sparql-results+json",
 }
-FOOTBALL_WORDS = ("futebol", "football", "soccer", "fútbol", "calcio")
-BAD_WORDS = ("seleção", "national", "feminin", "women", "basquete", "basketball")
+
+SECTION_PATTERNS = [
+    r"^(current )?(first[- ]team )?squad$",
+    r"^(current )?first[- ]team( players)?$",
+    r"^(current )?players$",
+    r"squad|first[- ]team|elenco",
+]
+PLAYER_RE = re.compile(
+    r"\{\{\s*(?:fs2?|football squad2?)[ _]player\b(.*?)\}\}", re.I | re.S
+)
+NAME_RE = re.compile(r"\|\s*name\s*=\s*(\[\[[^\]]+\]\]|[^|}]+)", re.I)
+LINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|([^\]]+))?\]\]")
+TEMPLATE_RE = re.compile(r"\{\{\s*([^{}|]*squad[^{}|]*?)\s*\}\}", re.I)
 
 
-def get_json(url, params, retries=3):
+def api(params, retries=3):
+    params = {**params, "format": "json", "formatversion": 2}
     last = None
     for attempt in range(1, retries + 1):
         try:
-            r = requests.get(url, params=params, headers=HEADERS, timeout=TIMEOUT)
+            r = requests.get(WP_API, params=params, headers=HEADERS, timeout=TIMEOUT)
             r.raise_for_status()
-            return r.json()
-        except (requests.RequestException, ValueError) as e:
+            data = r.json()
+            if "error" in data:
+                raise RuntimeError(data["error"].get("info", "erro da API"))
+            return data
+        except (requests.RequestException, ValueError, RuntimeError) as e:
             last = e
-            time.sleep(3 * attempt)
+            time.sleep(2 * attempt)
     raise RuntimeError(str(last))
 
 
-def resolve_club(term):
-    """Procura o clube no Wikidata. Retorna (qid, label, descricao) ou None."""
-    for lang in ("pt", "en"):
-        data = get_json(WD_API, {
-            "action": "wbsearchentities", "search": term, "language": lang,
-            "uselang": lang, "type": "item", "limit": 10, "format": "json",
-        })
-        for item in data.get("search", []):
-            desc = (item.get("description") or "").lower()
-            if any(w in desc for w in FOOTBALL_WORDS) and not any(b in desc for b in BAD_WORDS):
-                return item["id"], item.get("label", term), desc
-    return None
+def clean_title(title):
+    return re.sub(r"\s*\([^)]*\)\s*$", "", title).strip()
 
 
-def fetch_players(qid):
-    query = f"""
-    SELECT DISTINCT ?player ?playerLabel ?image WHERE {{
-      ?player p:P54 ?st .
-      ?st ps:P54 wd:{qid} .
-      OPTIONAL {{ ?st pq:P580 ?start }}
-      FILTER NOT EXISTS {{ ?st pq:P582 ?end }}
-      ?player wdt:P106 wd:Q937857 ;
-              wdt:P18 ?image .
-      FILTER NOT EXISTS {{ ?player wdt:P570 ?died }}
-      # só homens (os elencos masculinos)
-      FILTER NOT EXISTS {{ ?player wdt:P21 wd:Q6581072 }}
-      # descarta quem já tem um vínculo MAIS RECENTE e ainda aberto com outro clube
-      FILTER NOT EXISTS {{
-        ?player p:P54 ?st2 .
-        ?st2 ps:P54 ?other ;
-             pq:P580 ?start2 .
-        ?other wdt:P31 wd:Q476028 .
-        FILTER(?other != wd:{qid})
-        FILTER NOT EXISTS {{ ?st2 pq:P582 ?end2 }}
-        FILTER(?start2 > ?start)
-      }}
-      SERVICE wikibase:label {{ bd:serviceParam wikibase:language "pt,en". }}
-    }}
-    """
-    data = get_json(SPARQL, {"query": query, "format": "json"})
-    rows = []
-    for b in data["results"]["bindings"]:
-        label = b["playerLabel"]["value"]
-        if label.startswith("Q") and label[1:].isdigit():  # sem nome cadastrado
+def find_section(page):
+    data = api({"action": "parse", "page": page, "prop": "sections", "redirects": 1})
+    sections = data["parse"]["sections"]
+    for pattern in SECTION_PATTERNS:
+        for s in sections:
+            line = re.sub(r"<[^>]+>", "", s["line"]).strip().lower()
+            if re.search(pattern, line):
+                return s["index"], line
+    return None, None
+
+
+def wikitext(page, section=None):
+    params = {"action": "parse", "page": page, "prop": "wikitext", "redirects": 1}
+    if section:
+        params["section"] = section
+    wt = api(params)["parse"]["wikitext"]
+    return wt["*"] if isinstance(wt, dict) else wt
+
+
+def extract_players(text):
+    players = []
+    for m in PLAYER_RE.finditer(text):
+        nm = NAME_RE.search(m.group(1))
+        if not nm:
             continue
-        image = b["image"]["value"].replace("http://", "https://")
-        rows.append((b["player"]["value"].rsplit("/", 1)[-1], label, f"{image}?width=1200"))
-    return rows
+        raw = nm.group(1).strip()
+        link = LINK_RE.match(raw)
+        if link:
+            target = link.group(1).strip()
+            if target.lower().startswith(("file:", "image:")):
+                continue
+            display = clean_title((link.group(2) or target).strip())
+            players.append((display, target))
+        elif raw:
+            players.append((clean_title(raw), ""))  # sem link: o main.py busca pelo nome
+    return players
+
+
+def squad_for(page):
+    """Retorna (lista de (nome, titulo_wiki), descricao_da_fonte)."""
+    idx, line = find_section(page)
+    if not idx:
+        return [], "seção de elenco não encontrada"
+    text = wikitext(page, idx)
+    players = extract_players(text)
+    source = f"seção '{line}'"
+    if len(players) < MIN_PLAYERS:
+        # alguns clubes guardam o elenco em um modelo separado (Template:... squad)
+        for t in TEMPLATE_RE.findall(text):
+            try:
+                more = extract_players(wikitext("Template:" + t.strip()))
+            except Exception:
+                continue
+            if len(more) > len(players):
+                players, source = more, f"modelo '{t.strip()}'"
+    return players, source
 
 
 def main():
@@ -104,41 +132,37 @@ def main():
     with CLUBS_CSV.open(encoding="utf-8-sig", newline="") as f:
         clubs = list(csv.DictReader(f))
 
-    seen = set()
-    out_rows = []
-    problems = []
+    out_rows, problems, seen = [], [], set()
 
     for c in clubs:
         team = (c.get("name") or "").strip()
-        qid = (c.get("qid") or "").strip()
-        term = (c.get("search") or team).strip()
+        page = (c.get("wikipedia") or c.get("search") or team).strip()
         if not team:
             continue
         try:
-            if not qid:
-                found = resolve_club(term)
-                if not found:
-                    print(f"✗ {team}: clube não encontrado ({term!r}). Preencha a coluna qid.")
-                    problems.append(team)
-                    continue
-                qid, label, desc = found
-                print(f"• {team} -> {qid} ({label}; {desc})")
-            players = fetch_players(qid)
+            players, source = squad_for(page)
         except Exception as e:
-            print(f"✗ {team}: erro {e}")
+            print(f"✗ {team}: erro ao ler '{page}' ({e})")
             problems.append(team)
             continue
 
-        added = 0
-        for pid, label, url in players:
-            if pid in seen:  # jogador emprestado/duplicado: fica no 1º clube
+        if len(players) < MIN_PLAYERS:
+            print(f"✗ {team}: só {len(players)} jogadores em '{page}' ({source}). "
+                  f"Confira o título em clubs.csv.")
+            problems.append(team)
+            if not players:
                 continue
-            seen.add(pid)
-            out_rows.append([label, url, "", team])
-            added += 1
-        sample = ", ".join(p[1] for p in players[:4])
-        print(f"  {team}: {added} jogadores com foto (ex.: {sample})")
-        time.sleep(1.5)  # respeita o servidor
+
+        added = []
+        for display, target in players:
+            key = (target or display).lower()
+            if key in seen:  # jogador repetido: fica no 1º clube
+                continue
+            seen.add(key)
+            out_rows.append([display, "", target, team])
+            added.append(display)
+        print(f"✓ {team}: {len(added)} jogadores [{source}] (ex.: {', '.join(added[:5])})")
+        time.sleep(1)
 
     with OUT_CSV.open("w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
