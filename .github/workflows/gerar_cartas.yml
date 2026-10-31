@@ -55,7 +55,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Montar players.csv a partir dos clubes
-        if: ${{ inputs.build_list }}
+        if: ${{ inputs.build_list || hashFiles('players.csv') == '' }}
         run: python build_players.py
 
       - name: Gerar cartas
@@ -70,7 +70,8 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add players.csv output/
+          [ -f players.csv ] && git add players.csv || true
+          [ -d output ] && git add output || true
           if git diff --cached --quiet; then
             echo "Nada novo para commitar."
           else
