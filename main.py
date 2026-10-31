@@ -284,8 +284,15 @@ def main() -> int:
         print("Sem foto:", ", ".join(not_found))
     if failed:
         print("Falharam:", ", ".join(failed))
-    # só falha o job se nada funcionou
-    return 1 if ((failed or not_found) and ok == 0 and skipped == 0) else 0
+    # falha o job (com o motivo) se nenhuma carta foi gerada nem já existia
+    if ok == 0 and skipped == 0:
+        if not failed and not not_found:
+            teams = sorted({(r.get("team") or "").strip() for r in rows})
+            print(f"Nenhuma carta foi processada. Filtro de clube usado: {TEAM_FILTER!r}.")
+            print(f"Linhas no players.csv: {len(rows)}.")
+            print("Clubes disponíveis no players.csv:", ", ".join(teams) or "(nenhum)")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
