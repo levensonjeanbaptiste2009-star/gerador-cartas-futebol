@@ -91,7 +91,8 @@ def _wiki_query(lang: str, extra: dict) -> list:
 
 def find_photo(name: str, wiki_title: str = ""):
     """Retorna (url_da_imagem, url_da_pagina) ou None."""
-    for lang in ("pt", "en"):
+    # com título exato (vem da Wikipédia em inglês) começa por "en"
+    for lang in (("en", "pt") if wiki_title else ("pt", "en")):
         try:
             if wiki_title:
                 pages = _wiki_query(lang, {"titles": wiki_title})
