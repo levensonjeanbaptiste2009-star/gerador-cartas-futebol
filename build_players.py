@@ -62,13 +62,26 @@ def resolve_club(term):
 
 def fetch_players(qid):
     query = f"""
-    SELECT ?player ?playerLabel ?image WHERE {{
+    SELECT DISTINCT ?player ?playerLabel ?image WHERE {{
       ?player p:P54 ?st .
       ?st ps:P54 wd:{qid} .
+      OPTIONAL {{ ?st pq:P580 ?start }}
       FILTER NOT EXISTS {{ ?st pq:P582 ?end }}
       ?player wdt:P106 wd:Q937857 ;
               wdt:P18 ?image .
       FILTER NOT EXISTS {{ ?player wdt:P570 ?died }}
+      # só homens (os elencos masculinos)
+      FILTER NOT EXISTS {{ ?player wdt:P21 wd:Q6581072 }}
+      # descarta quem já tem um vínculo MAIS RECENTE e ainda aberto com outro clube
+      FILTER NOT EXISTS {{
+        ?player p:P54 ?st2 .
+        ?st2 ps:P54 ?other ;
+             pq:P580 ?start2 .
+        ?other wdt:P31 wd:Q476028 .
+        FILTER(?other != wd:{qid})
+        FILTER NOT EXISTS {{ ?st2 pq:P582 ?end2 }}
+        FILTER(?start2 > ?start)
+      }}
       SERVICE wikibase:label {{ bd:serviceParam wikibase:language "pt,en". }}
     }}
     """
@@ -123,7 +136,8 @@ def main():
             seen.add(pid)
             out_rows.append([label, url, "", team])
             added += 1
-        print(f"  {team}: {added} jogadores com foto")
+        sample = ", ".join(p[1] for p in players[:4])
+        print(f"  {team}: {added} jogadores com foto (ex.: {sample})")
         time.sleep(1.5)  # respeita o servidor
 
     with OUT_CSV.open("w", encoding="utf-8", newline="") as f:
